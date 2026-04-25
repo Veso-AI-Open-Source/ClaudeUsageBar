@@ -6,6 +6,7 @@
   "license": "MIT",
   "author": {
     "name": "Veso AI",
+    "email": "opensource@veso.ai",
     "url": "https://github.com/Veso-AI-Open-Source"
   },
   "homepage": "https://github.com/Veso-AI-Open-Source/ClaudeUsageBar",
