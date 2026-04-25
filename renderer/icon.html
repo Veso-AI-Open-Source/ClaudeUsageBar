@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline';" />
+</head>
+<body>
+<script>
+  // Native-feeling, ASCII/LED-bar style usage indicator.
+  // Drawn as primitive rectangles (not text glyphs) so segments render
+  // pixel-clean at any size. Output is monochrome black-on-transparent;
+  // main process flags it as a macOS template image so it auto-tints to
+  // match the menu-bar appearance (white on dark, black on light).
+  window.drawIcon = function(percent, scale) {
+    scale = scale || 2;
+
+    const W = 22;          // logical width  (points)
+    const H = 22;          // logical height (points)
+    const SEGMENTS = 5;
+    const SEG_W = 3;
+    const GAP   = 1;
+    const SEG_H = 10;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W * scale;
+    canvas.height = H * scale;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(scale, scale);
+
+    const totalW = SEGMENTS * SEG_W + (SEGMENTS - 1) * GAP;
+    const x0 = Math.round((W - totalW) / 2);
+    const y0 = Math.round((H - SEG_H) / 2);
+
+    const pct   = Math.max(0, Math.min(100, Number(percent) || 0));
+    const exact = (pct / 100) * SEGMENTS;
+
+    ctx.fillStyle = '#000';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1;
+
+    for (let i = 0; i < SEGMENTS; i++) {
+      const x = x0 + i * (SEG_W + GAP);
+      const remaining = exact - i;
+
+      if (remaining >= 1) {
+        // Full filled segment
+        ctx.fillRect(x, y0, SEG_W, SEG_H);
+      } else {
+        // Hollow outline (track) — drawn at half-pixel for crisp 1px stroke
+        ctx.strokeRect(x + 0.5, y0 + 0.5, SEG_W - 1, SEG_H - 1);
+        // Partial fill from the bottom for fractional segments
+        if (remaining > 0.05) {
+          const fillH = Math.max(1, Math.round(SEG_H * remaining));
+          ctx.fillRect(x, y0 + SEG_H - fillH, SEG_W, fillH);
+        }
+      }
+    }
+
+    return canvas.toDataURL('image/png');
+  };
+</script>
+</body>
+</html>

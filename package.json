@@ -1,0 +1,66 @@
+{
+  "name": "claude-usage-bar",
+  "version": "2.0.0",
+  "description": "Cross-platform tray app showing Claude Code usage at a glance.",
+  "main": "main.js",
+  "license": "MIT",
+  "author": {
+    "name": "Veso AI",
+    "url": "https://github.com/Veso-AI-Open-Source"
+  },
+  "homepage": "https://github.com/Veso-AI-Open-Source/ClaudeUsageBar",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Veso-AI-Open-Source/ClaudeUsageBar.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Veso-AI-Open-Source/ClaudeUsageBar/issues"
+  },
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^32.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "ai.veso.claude-usage-bar",
+    "productName": "ClaudeUsageBar",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**",
+      "src/**",
+      "assets/**"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Veso-AI-Open-Source",
+        "repo": "ClaudeUsageBar"
+      }
+    ],
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] },
+        { "target": "zip", "arch": ["arm64", "x64"] }
+      ],
+      "category": "public.app-category.developer-tools",
+      "extendInfo": {
+        "LSUIElement": true
+      }
+    },
+    "win": {
+      "target": ["nsis", "portable"]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Utility"
+    }
+  }
+}
