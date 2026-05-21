@@ -1,15 +1,13 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, screen, shell, powerMonitor } = require('electron');
 const path = require('path');
 
-const { readCredentials } = require('./src/credentials');
-const { fetchUsage } = require('./src/api');
-const { parseLocalLogs, bucketTotal } = require('./src/localUsage');
+const { readCredentials, REASON } = require('./src/credentials');
+const { snapshotForRenderer, worstWindow, sessionPercent, weeklyPercent, opusPercent } = require('./src/derivations');
+const { createPoller } = require('./src/poller');
 
 let tray = null;
 let popup = null;
 let iconRenderer = null;
-let pollTimer = null;
-let consecutiveErrors = 0;
 let cachedToken = null;
 
 const state = {
@@ -19,108 +17,55 @@ const state = {
   rateLimitTier: '',
   lastUpdated: null,
   errorMessage: null,
+  // Typed credential failure surface — null while creds are healthy.
+  // Shape: { reason: REASON.*, pathsTried: [{source,status,detail?}] }
+  credentialError: null,
   isLoading: false,
   hasLoaded: false,
 };
 
-const BASE_INTERVAL_MS = 60 * 1000;
-const MAX_INTERVAL_MS = 15 * 60 * 1000;
+const CRED_ERROR_COPY = {
+  [REASON.NOT_FOUND]:         'No Claude Code credentials found. Launch Claude Code and sign in.',
+  [REASON.UNREADABLE]:        'Credentials file exists but couldn’t be read.',
+  [REASON.MALFORMED]:         'Credentials file is unreadable or corrupt.',
+  [REASON.EXPIRED]:           'Token expired. Open Claude Code to sign in again.',
+  [REASON.LOCKED_KEYCHAIN]:   'Keychain access denied. Click “Always Allow” on the prompt.',
+  [REASON.PERMISSION_DENIED]: 'Permission denied reading credentials file.',
+};
 
-function clamp(v) {
-  if (v == null || !Number.isFinite(v)) return 0;
-  return Math.max(0, Math.min(100, v));
-}
-
-function sessionPercent() { return clamp(state.usage?.five_hour?.utilization); }
-function weeklyPercent() { return clamp(state.usage?.seven_day?.utilization); }
-function opusPercent() { return clamp(state.usage?.seven_day_opus?.utilization); }
-
-function sessionElapsedPercent() {
-  const resetStr = state.usage?.five_hour?.resets_at;
-  if (!resetStr) return 0;
-  const reset = new Date(resetStr);
-  if (Number.isNaN(reset.getTime())) return 0;
-  const remainingMs = reset.getTime() - Date.now();
-  if (remainingMs <= 0) return 100;
-  const windowMs = 5 * 3600 * 1000;
-  const elapsed = windowMs - remainingMs;
-  return Math.max(0, Math.min(100, (elapsed / windowMs) * 100));
-}
-
-function worstWindow() {
-  const candidates = [
-    { tag: 'S', percent: sessionPercent() },
-    { tag: 'W', percent: weeklyPercent() },
-    { tag: 'O', percent: opusPercent() },
-  ];
-  return candidates.reduce((a, b) => (b.percent > a.percent ? b : a));
-}
-
-function statusColor(percent) {
-  if (percent >= 80) return '#ff3b30';
-  if (percent >= 50) return '#ff9500';
-  return '#34c759';
-}
-
-function planDisplayName() {
-  const sub = (state.subscriptionType || '').toLowerCase();
-  const tier = state.rateLimitTier || '';
-  if (sub === 'max') {
-    if (tier.includes('20x')) return 'Max 20x';
-    if (tier.includes('5x')) return 'Max 5x';
-    return 'Max';
+function loadCredentials() {
+  const result = readCredentials();
+  if (result.ok) {
+    cachedToken = result.oauth.accessToken;
+    state.subscriptionType = result.oauth.subscriptionType || '';
+    state.rateLimitTier = result.oauth.rateLimitTier || '';
+    state.credentialError = null;
+    return;
   }
-  if (sub === 'pro') return 'Pro';
-  if (sub === 'free') return 'Free';
-  return state.subscriptionType
-    ? state.subscriptionType[0].toUpperCase() + state.subscriptionType.slice(1)
-    : 'Unknown';
+  cachedToken = null;
+  state.credentialError = { reason: result.reason, pathsTried: result.pathsTried || [] };
+  state.errorMessage = CRED_ERROR_COPY[result.reason] || 'Could not read Claude Code credentials.';
 }
 
-function timeUntilReset(isoString) {
-  if (!isoString) return null;
-  const t = new Date(isoString).getTime();
-  if (Number.isNaN(t)) return null;
-  const interval = t - Date.now();
-  if (interval <= 0) return 'resetting…';
-  const totalMin = Math.floor(interval / 60000);
-  const days = Math.floor(totalMin / (60 * 24));
-  const hours = Math.floor(totalMin / 60) % 24;
-  const minutes = totalMin % 60;
-  if (days > 0) return hours > 0 ? `resets in ${days}d ${hours}h` : `resets in ${days}d`;
-  if (hours > 0) return `resets in ${hours}h ${minutes}m`;
-  return `resets in ${Math.max(1, minutes)}m`;
+function popupVisible() {
+  return !!(popup && !popup.isDestroyed() && popup.isVisible());
 }
 
-function snapshotForRenderer() {
-  return {
-    hasLoaded: state.hasLoaded,
-    isLoading: state.isLoading,
-    errorMessage: state.errorMessage,
-    lastUpdated: state.lastUpdated ? state.lastUpdated.toISOString() : null,
-    sessionPercent: sessionPercent(),
-    sessionElapsedPercent: sessionElapsedPercent(),
-    weeklyPercent: weeklyPercent(),
-    opusPercent: opusPercent(),
-    sonnetPercent: clamp(state.usage?.seven_day_sonnet?.utilization),
-    fiveHourResetIn: timeUntilReset(state.usage?.five_hour?.resets_at),
-    sevenDayResetIn: timeUntilReset(state.usage?.seven_day?.resets_at),
-    extraUsage: state.usage?.extra_usage ?? null,
-    planName: planDisplayName(),
-    localCosts: state.localCosts ? {
-      todayTokens: state.localCosts.todayTokens,
-      weekTokens: state.localCosts.weekTokens,
-      monthTokens: state.localCosts.monthTokens,
-      sessionTotal: bucketTotal(state.localCosts.sessionUsage),
-      sessionInput: state.localCosts.sessionUsage.input + state.localCosts.sessionUsage.cacheRead + state.localCosts.sessionUsage.cacheWrite,
-      sessionOutput: state.localCosts.sessionUsage.output,
-      weeklyTotal: bucketTotal(state.localCosts.weeklyUsage),
-      weeklyInput: state.localCosts.weeklyUsage.input + state.localCosts.weeklyUsage.cacheRead + state.localCosts.weeklyUsage.cacheWrite,
-      weeklyOutput: state.localCosts.weeklyUsage.output,
-      modelBreakdown: state.localCosts.modelBreakdown,
-    } : null,
-  };
+function pushToWindow() {
+  if (popup && !popup.isDestroyed()) {
+    popup.webContents.send('state', snapshotForRenderer(state));
+  }
 }
+
+const poller = createPoller({
+  state,
+  getToken: () => cachedToken,
+  setToken: (t) => { cachedToken = t; },
+  loadCredentials,
+  pushToWindow,
+  refreshTray: () => refreshTray(),
+  popupVisible,
+});
 
 async function setupIconRenderer() {
   iconRenderer = new BrowserWindow({
@@ -138,25 +83,20 @@ async function makeTrayIcon(percent) {
   );
   const buf = Buffer.from(dataUrl.split(',')[1], 'base64');
   const img = nativeImage.createFromBuffer(buf, { scaleFactor: 2.0 });
-  if (process.platform === 'darwin') {
-    // Template image: macOS auto-tints to match menu-bar appearance.
-    img.setTemplateImage(true);
-  }
+  if (process.platform === 'darwin') img.setTemplateImage(true);
   return img;
 }
 
 async function refreshTray() {
   if (!tray) return;
-  const percent = state.hasLoaded ? worstWindow().percent : 0;
+  const percent = state.hasLoaded ? worstWindow(state).percent : 0;
   try {
     const img = await makeTrayIcon(percent);
     if (img) tray.setImage(img);
   } catch {}
 
-  const tag = state.hasLoaded ? worstWindow().tag : '';
-  const titleText = state.hasLoaded
-    ? `${Math.round(percent)}% ${tag}`
-    : '—';
+  const tag = state.hasLoaded ? worstWindow(state).tag : '';
+  const titleText = state.hasLoaded ? `${Math.round(percent)}% ${tag}` : '—';
   if (process.platform === 'darwin' && typeof tray.setTitle === 'function') {
     tray.setTitle(' ' + titleText);
   }
@@ -166,117 +106,12 @@ async function refreshTray() {
 function buildTooltip() {
   if (!state.hasLoaded) return 'Claude Usage — loading…';
   const parts = [
-    `Session: ${Math.round(sessionPercent())}%`,
-    `Weekly: ${Math.round(weeklyPercent())}%`,
+    `Session: ${Math.round(sessionPercent(state))}%`,
+    `Weekly: ${Math.round(weeklyPercent(state))}%`,
   ];
-  const opus = opusPercent();
+  const opus = opusPercent(state);
   if (opus > 0) parts.push(`Opus (7d): ${Math.round(opus)}%`);
   return 'Claude Usage — ' + parts.join(' · ');
-}
-
-async function refresh({ forceSource = false } = {}) {
-  state.isLoading = true;
-  pushToWindow();
-
-  if (forceSource || !cachedToken) loadCredentials();
-  if (!cachedToken) {
-    state.errorMessage = 'No Claude Code credentials found. Launch Claude Code first.';
-    consecutiveErrors += 1;
-    state.isLoading = false;
-    pushToWindow();
-    await refreshTray();
-    return;
-  }
-
-  const sessionResetAt = state.usage?.five_hour?.resets_at
-    ? new Date(state.usage.five_hour.resets_at) : null;
-  const weeklyResetAt = state.usage?.seven_day?.resets_at
-    ? new Date(state.usage.seven_day.resets_at) : null;
-
-  const [apiResult, logs] = await Promise.all([
-    fetchUsage(cachedToken),
-    parseLocalLogs({
-      sessionResetAt: validDate(sessionResetAt),
-      weeklyResetAt: validDate(weeklyResetAt),
-    }),
-  ]);
-
-  state.localCosts = logs;
-  state.lastUpdated = new Date();
-
-  if (apiResult.ok) {
-    state.usage = apiResult.data;
-    state.hasLoaded = true;
-    state.errorMessage = null;
-    consecutiveErrors = 0;
-  } else if (apiResult.status === 401 || apiResult.status === 403) {
-    cachedToken = null;
-    loadCredentials();
-    state.errorMessage = cachedToken
-      ? 'Refreshed token; retrying soon.'
-      : 'Token expired. Open Claude Code to sign in again.';
-    consecutiveErrors += 1;
-  } else if (apiResult.status === 429) {
-    state.errorMessage = 'Rate-limited by API. Retrying soon.';
-    consecutiveErrors += 1;
-  } else if (apiResult.status >= 500) {
-    state.errorMessage = `Anthropic API unavailable (${apiResult.status}).`;
-    consecutiveErrors += 1;
-  } else if (apiResult.error === 'timeout') {
-    state.errorMessage = 'Request timed out.';
-    consecutiveErrors += 1;
-  } else if (apiResult.code === 'ENOTFOUND' || apiResult.code === 'EAI_AGAIN') {
-    state.errorMessage = 'Offline';
-    consecutiveErrors += 1;
-  } else {
-    state.errorMessage = apiResult.error
-      ? `API error: ${apiResult.error}`
-      : `API error (HTTP ${apiResult.status ?? '?'})`;
-    consecutiveErrors += 1;
-  }
-
-  state.isLoading = false;
-  pushToWindow();
-  await refreshTray();
-}
-
-function validDate(d) {
-  if (!d) return null;
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function loadCredentials() {
-  const oauth = readCredentials();
-  if (!oauth) {
-    cachedToken = null;
-    state.errorMessage = 'No Claude Code credentials found.';
-    return;
-  }
-  cachedToken = oauth.accessToken;
-  state.subscriptionType = oauth.subscriptionType || '';
-  state.rateLimitTier = oauth.rateLimitTier || '';
-}
-
-function nextPollDelayMs() {
-  if (consecutiveErrors === 0) return BASE_INTERVAL_MS;
-  const exp = Math.min(consecutiveErrors, 6);
-  const backoff = Math.min(BASE_INTERVAL_MS * Math.pow(2, exp - 1), MAX_INTERVAL_MS);
-  const jitter = Math.random() * Math.min(5000, backoff * 0.1);
-  return backoff + jitter;
-}
-
-function schedulePoll() {
-  if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = setTimeout(async () => {
-    await refresh();
-    schedulePoll();
-  }, nextPollDelayMs());
-}
-
-function pushToWindow() {
-  if (popup && !popup.isDestroyed()) {
-    popup.webContents.send('state', snapshotForRenderer());
-  }
 }
 
 function createPopup() {
@@ -326,7 +161,6 @@ function positionPopup() {
       y = aboveTray >= work.y ? aboveTray : belowTray;
     }
   } else {
-    // Fallback (Linux often returns empty bounds): place near top-right of work area.
     x = work.x + work.width - winBounds.width - 8;
     y = work.y + 8;
   }
@@ -340,19 +174,23 @@ function togglePopup() {
   if (!popup) return;
   if (popup.isVisible()) {
     popup.hide();
+    poller.nudge();
     return;
   }
   positionPopup();
   popup.show();
   popup.focus();
   pushToWindow();
+  // Opening nudges a refresh; throttle guards still apply.
+  poller.refresh();
+  poller.nudge();
 }
 
 function buildContextMenu() {
   return Menu.buildFromTemplate([
     { label: 'Open', click: () => togglePopup() },
-    { label: 'Refresh', click: () => refresh() },
-    { label: 'Re-read credentials', click: () => refresh({ forceSource: true }) },
+    { label: 'Refresh', click: () => poller.refresh({ manual: true }) },
+    { label: 'Re-read credentials', click: () => poller.refresh({ forceSource: true, manual: true }) },
     { type: 'separator' },
     { label: 'Open Anthropic console', click: () => shell.openExternal('https://console.anthropic.com/') },
     { type: 'separator' },
@@ -372,12 +210,28 @@ async function setupTray() {
   await refreshTray();
 }
 
-ipcMain.handle('refresh', () => refresh());
-ipcMain.handle('refresh-force', () => refresh({ forceSource: true }));
-ipcMain.handle('quit', () => app.quit());
-ipcMain.handle('hide', () => { if (popup) popup.hide(); });
-ipcMain.handle('open-external', (_e, url) => shell.openExternal(url));
-ipcMain.handle('get-state', () => snapshotForRenderer());
+// IPC: handle() for anything that returns a value or whose completion the
+// renderer awaits; on() for fire-and-forget commands (no return → no point
+// paying for a promise round-trip).
+ipcMain.handle('get-state', () => snapshotForRenderer(state));
+ipcMain.handle('refresh', () => poller.refresh({ manual: true }));
+ipcMain.handle('refresh-force', () => poller.refresh({ forceSource: true, manual: true }));
+
+ipcMain.on('hide', () => { if (popup) popup.hide(); });
+ipcMain.on('quit', () => app.quit());
+ipcMain.on('open-external', (_e, url) => {
+  let parsed;
+  try { parsed = new URL(String(url)); } catch { return; }
+  if (parsed.protocol !== 'https:') return;
+  shell.openExternal(parsed.toString());
+});
+ipcMain.on('set-height', (_e, h) => {
+  if (!popup || popup.isDestroyed()) return;
+  const want = Math.max(220, Math.min(900, Math.round(Number(h) || 0)));
+  const [w] = popup.getSize();
+  popup.setSize(w, want, false);
+  if (popup.isVisible()) positionPopup();
+});
 
 app.on('window-all-closed', (e) => { e.preventDefault(); });
 
@@ -385,14 +239,22 @@ if (process.platform === 'darwin' && app.dock) {
   app.dock.hide();
 }
 
-app.whenReady().then(async () => {
-  await setupIconRenderer();
-  createPopup();
-  await setupTray();
-  await refresh();
-  schedulePoll();
-});
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => { if (popup) togglePopup(); });
 
-app.on('before-quit', () => {
-  if (pollTimer) clearTimeout(pollTimer);
-});
+  app.whenReady().then(async () => {
+    await setupIconRenderer();
+    createPopup();
+    await setupTray();
+    loadCredentials();
+    await poller.start();
+
+    // setTimeout doesn't fire during macOS sleep; force a refresh on wake.
+    powerMonitor.on('resume', () => poller.nudge({ immediate: true }));
+  });
+}
+
+app.on('before-quit', () => { poller.stop(); });

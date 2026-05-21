@@ -59,6 +59,11 @@ async function parseLocalLogs({ sessionResetAt = null, weeklyResetAt = null } = 
 
   const files = collectJsonl(projectsDir, monthStart);
 
+  // Claude Code re-emits the same assistant message under multiple parent
+  // chains (subagents, resumed sessions). Counting each occurrence inflates
+  // totals 1.5–3×. Dedupe by `message.id` across all files in this walk.
+  const seenMsgIds = new Set();
+
   for (const file of files) {
     let content;
     try { content = fs.readFileSync(file, 'utf8'); }
@@ -76,6 +81,11 @@ async function parseLocalLogs({ sessionResetAt = null, weeklyResetAt = null } = 
       if (!message) continue;
       const usage = message.usage;
       if (!usage) continue;
+
+      if (message.id) {
+        if (seenMsgIds.has(message.id)) continue;
+        seenMsgIds.add(message.id);
+      }
 
       const tsRaw = obj.timestamp;
       if (!tsRaw) continue;
