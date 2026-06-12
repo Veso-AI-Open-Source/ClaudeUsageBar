@@ -97,6 +97,7 @@ function fmtRate(tokPerMin) {
 
 function modelColor(model) {
   const m = String(model || '');
+  if (m.startsWith('Fable') || m.startsWith('Mythos')) return '#ff9f0a';
   if (m.startsWith('Opus')) return '#bf5af2';
   if (m.startsWith('Sonnet')) return '#0a84ff';
   if (m.startsWith('Haiku')) return '#64d2ff';
